@@ -165,7 +165,7 @@ void read_av_info(const char * av_pathfile)
 int main(){
 	//av_register_all();
 	cout<<"audio info:"<<endl;
-	char *path = "/opt/develop/project4c_eclipse/EP04.mp4";
+	char *path = "/home/jx/work/ide/eclipse-cpp-oxygen-1a-linux-gtk-x86_64/project/ffmpegtest1/1.mp3";
 	read_av_info(path);
 	return 0;
 }
