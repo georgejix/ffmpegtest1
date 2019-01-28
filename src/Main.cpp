@@ -1,171 +1,128 @@
 #include <iostream>
-#include "pch.h"
-
+#include "GetFileInfo.h"
+#include "TranscodecAcc.h"
 using namespace std;
 
-#include <stdio.h>
-char* BytesToSize( double Bytes )
-{
-    float tb = 1099511627776;
-    float gb = 1073741824;
-    float mb = 1048576;
-    float kb = 1024;
+void transcodecAudio(char * inputFile, char * outputFile){
+	AVFormatContext *input_format_context = NULL, *output_format_context = NULL;
+	AVCodecContext *input_codec_context = NULL, *output_codec_context = NULL;
+	SwrContext *resample_context = NULL;
+	AVAudioFifo *fifo = NULL;
+	int ret = AVERROR_EXIT;
 
-    char returnSize[256];
+	/** Register all codecs and formats so that they can be used. */
+	    av_register_all();
+	    /** Open the input file for reading. */
+	    if (open_input_file(inputFile, &input_format_context,
+	                        &input_codec_context))
+	        goto cleanup;
+	    /** Open the output file for writing. */
+	    if (open_output_file(outputFile, input_codec_context,
+	                         &output_format_context, &output_codec_context))
+	        goto cleanup;
+	    /** Initialize the resampler to be able to convert audio sample formats. */
+	    if (init_resampler(input_codec_context, output_codec_context,
+	                       &resample_context))
+	        goto cleanup;
+	    /** Initialize the FIFO buffer to store audio samples to be encoded. */
+	    if (init_fifo(&fifo, output_codec_context))
+	        goto cleanup;
+	    /** Write the header of the output file container. */
+	    if (write_output_file_header(output_format_context))
+	        goto cleanup;
 
-    if( Bytes >= tb )
-        sprintf(returnSize, "%.2f TB", (float)Bytes/tb);
-    else if( Bytes >= gb && Bytes < tb )
-        sprintf(returnSize, "%.2f GB", (float)Bytes/gb);
-    else if( Bytes >= mb && Bytes < gb )
-        sprintf(returnSize, "%.2f MB", (float)Bytes/mb);
-    else if( Bytes >= kb && Bytes < mb )
-        sprintf(returnSize, "%.2f KB", (float)Bytes/kb);
-    else if ( Bytes < kb)
-        sprintf(returnSize, "%.2f Bytes", Bytes);
-    else
-        sprintf(returnSize, "%.2f Bytes", Bytes);
+	    /**
+	     * Loop as long as we have input samples to read or output samples
+	     * to write; abort as soon as we have neither.
+	     */
+	    while (1) {
+	        /** Use the encoder's desired frame size for processing. */
+	        const int output_frame_size = output_codec_context->frame_size;
+	        int finished                = 0;
 
-    static char ret[256];
-    strcpy(ret, returnSize);
-    return ret;
-}
+	        /**
+	         * Make sure that there is one frame worth of samples in the FIFO
+	         * buffer so that the encoder can do its work.
+	         * Since the decoder's and the encoder's frame size may differ, we
+	         * need to FIFO buffer to store as many frames worth of input samples
+	         * that they make up at least one frame worth of output samples.
+	         */
+	        while (av_audio_fifo_size(fifo) < output_frame_size) {
+	            /**
+	             * Decode one frame worth of audio samples, convert it to the
+	             * output sample format and put it into the FIFO buffer.
+	             */
+	            if (read_decode_convert_and_store(fifo, input_format_context,
+	                                              input_codec_context,
+	                                              output_codec_context,
+	                                              resample_context, &finished))
+	                goto cleanup;
 
-void read_av_info(const char * av_pathfile)
-{
-	printf("%s\n", av_pathfile);
-    AVFormatContext     *pfmtCxt    = NULL;
+	            /**
+	             * If we are at the end of the input file, we continue
+	             * encoding the remaining audio samples to the output file.
+	             */
+	            if (finished)
+	                break;
+	        }
 
-    int                 audioStreamIdx  = -1;
-    int                 videoStreamIdx  = -1;
-    //初始化 libavformat和注册所有的muxers、demuxers和protocols
-    av_register_all();
+	        /**
+	         * If we have enough samples for the encoder, we encode them.
+	         * At the end of the file, we pass the remaining samples to
+	         * the encoder.
+	         */
+	        while (av_audio_fifo_size(fifo) >= output_frame_size ||
+	               (finished && av_audio_fifo_size(fifo) > 0))
+	            /**
+	             * Take one frame worth of audio samples from the FIFO buffer,
+	             * encode it and write it to the output file.
+	             */
+	            if (load_encode_and_write(fifo, output_format_context,
+	                                      output_codec_context))
+	                goto cleanup;
 
-    //以输入方式打开一个媒体文件,也即源文件
-    int ok = avformat_open_input(&pfmtCxt, av_pathfile, NULL, NULL);
-    if (ok != 0) {
-        printf("Could not open file.\n");
-        //fflush(stdout);
-    }
+	        /**
+	         * If we are at the end of the input file and have encoded
+	         * all remaining samples, we can exit this loop and finish.
+	         */
+	        if (finished) {
+	            int data_written;
+	            /** Flush the encoder as it may have delayed frames. */
+	            do {
+	                if (encode_audio_frame(NULL, output_format_context,
+	                                       output_codec_context, &data_written))
+	                    goto cleanup;
+	            } while (data_written);
+	            break;
+	        }
+	    }
 
-    //通过读取媒体文件的中的包来获取媒体文件中的流信息,对于没有头信息的文件如(mpeg)是非常有用的
-    //也就是把媒体文件中的音视频流等信息读出来,保存在容器中,以便解码时使用
-    ok = avformat_find_stream_info(pfmtCxt, NULL);
-    if (ok != 0) {
-        printf("find stream info error.\n");
-    }
+	    /** Write the trailer of the output file container. */
+	    if (write_output_file_trailer(output_format_context))
+	        goto cleanup;
+	    ret = 0;
 
-    for (int i = 0; i < pfmtCxt->nb_streams; i++) {
-        if (pfmtCxt->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-            videoStreamIdx = i;
-        } else if (pfmtCxt->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
-            audioStreamIdx = i;
-        }
-    }
-
-    AVStream *videostream = NULL;
-    AVStream *audiostream = NULL;
-    if (videoStreamIdx != -1) {
-        videostream = pfmtCxt->streams[videoStreamIdx];
-    }
-    if (audioStreamIdx != -1) {
-        audiostream = pfmtCxt->streams[audioStreamIdx];
-    }
-    printf("==============================av_dump_format==================================\n");
-    av_dump_format(pfmtCxt, 0, 0, 0);
-    //******************************输出相关media文件信息******************************
-    printf("===========================================================================\n");
-    //printf("文件名 : %s \n",pfmtCxt->url);
-    printf("输入格式 : %s \n全称 : %s \n",pfmtCxt->iformat->name,pfmtCxt->iformat->long_name);
-
-    int64_t tns, thh, tmm, tss;
-    tns  = pfmtCxt->duration / 1000000;
-    thh  = tns / 3600;
-    tmm  = (tns % 3600) / 60;
-    tss  = (tns % 60);
-
-    printf("总时长 : %f ms,fmt:%02lld:%02lld:%02lld \n总比特率 : %f kbs\n",(pfmtCxt->duration * 1.0 / AV_TIME_BASE) * 1000,thh,tmm,tss,pfmtCxt->bit_rate / 1000.0);//1000 bit/s = 1 kbit/s
-    double fsize = (pfmtCxt->duration * 1.0 / AV_TIME_BASE * pfmtCxt->bit_rate / 8.0);
-    printf("文件大小 : %s\n",BytesToSize(fsize));
-    printf("协议白名单 : %s \n协义黑名单 : %s\n",pfmtCxt->protocol_whitelist,pfmtCxt->protocol_blacklist);
-    printf("数据包的最大数量 : %d\n",pfmtCxt->max_ts_probe);
-    printf("最大缓冲时间 : %lld\n",pfmtCxt->max_interleave_delta);
-    printf("缓冲帧的最大缓冲 : %u Bytes\n",pfmtCxt->max_picture_buffer);
-    printf("metadata:\n");
-    AVDictionary *metadata = pfmtCxt->metadata;
-    if (metadata) {
-        AVDictionaryEntry *entry = NULL;
-        while ((entry = av_dict_get(metadata, "", entry, AV_DICT_IGNORE_SUFFIX))) {
-            printf("\t%s : %s\n",entry->key,entry->value);
-        }
-    }
-    if (videostream) {
-        printf("视频流信息(%s):\n",av_get_media_type_string(videostream->codec->codec_type));
-        printf("\tStream #%d\n",videoStreamIdx);
-        printf("\t总帧数 : %lld\n",videostream->nb_frames);
-        const char *avcodocname = avcodec_get_name(videostream->codec->codec_id);
-        const char *profilestring = avcodec_profile_name(videostream->codec->codec_id,videostream->codec->profile);
-        //char * codec_fourcc = av_fourcc2str(videostream->codec->codec_tag);
-        //printf("\t编码方式 : %s\n\tCodec Profile : %s\n\tCodec FourCC : %s\n",avcodocname,profilestring,codec_fourcc);
-        ///如果是C++引用(AVPixelFormat)注意下强转类型
-        //const char *pix_fmt_name = videostream->codec->format == AV_PIX_FMT_NONE ? "none" : av_get_pix_fmt_name(videostream->codec->format);
-
-        //printf("\t显示编码格式(color space) : %s \n",pix_fmt_name);
-        printf("\t宽 : %d pixels,高 : %d pixels \n",videostream->codec->width,videostream->codec->height);
-        AVRational display_aspect_ratio;
-        av_reduce(&display_aspect_ratio.num, &display_aspect_ratio.den,
-                  videostream->codec->width  * (int64_t)videostream->sample_aspect_ratio.num,
-                  videostream->codec->height * (int64_t)videostream->sample_aspect_ratio.den,
-                  1024 * 1024);
-        printf("\tsimple_aspect_ratio(SAR) : %d : %d\n\tdisplay_aspect_ratio(DAR) : %d : %d \n",videostream->sample_aspect_ratio.num,
-               videostream->sample_aspect_ratio.den,display_aspect_ratio.num,display_aspect_ratio.den);
-        printf("\t最低帧率 : %f fps\n\t平均帧率 : %f fps\n",av_q2d(videostream->r_frame_rate),av_q2d(videostream->avg_frame_rate));
-        printf("\t每个像素点的比特数 : %d bits\n",videostream->codec->bits_per_raw_sample);
-        printf("\t每个像素点编码比特数 : %d bits\n",videostream->codec->bits_per_coded_sample); //YUV三个分量每个分量是8,即24
-        printf("\t视频流比特率 : %f kbps\n",videostream->codec->bit_rate / 1000.0);
-        printf("\t基准时间 : %d / %d = %f \n",videostream->time_base.num,videostream->time_base.den,av_q2d(videostream->time_base));
-        printf("\t视频流时长 : %f ms\n",videostream->duration * av_q2d(videostream->time_base) * 1000);
-        printf("\t帧率(tbr) : %f\n",av_q2d(videostream->r_frame_rate));
-        printf("\t文件层的时间精度(tbn) : %f\n",1/av_q2d(videostream->time_base));
-        printf("\t视频层的时间精度(tbc) : %f\n",1/av_q2d(videostream->codec ->time_base));
-
-        double s = videostream->duration * av_q2d(videostream->time_base);
-        int64_t tbits = videostream->codec->bit_rate * s;
-        double stsize = tbits / 8;
-        printf("\t视频流大小(Bytes) : %s \n",BytesToSize(stsize));
-        printf("\tmetadata:\n");
-
-        AVDictionary *metadata = videostream->metadata;
-        if (metadata) {
-            AVDictionaryEntry *entry = NULL;
-            while ((entry = av_dict_get(metadata, "", entry, AV_DICT_IGNORE_SUFFIX))) {
-                printf("\t\t%s : %s\n",entry->key,entry->value);
-            }
-        }
-    }
-
-    if (audiostream) {
-        printf("音频流信息(%s):\n",av_get_media_type_string(audiostream->codec->codec_type));
-        printf("\tStream #%d\n",audioStreamIdx);
-        printf("\t音频时长 : %f ms\n",audiostream->duration * av_q2d(audiostream->time_base) * 1000);
-        const char *avcodocname = avcodec_get_name(audiostream->codec->codec_id);
-        const char *profilestring = avcodec_profile_name(audiostream->codec->codec_id,audiostream->codec->profile);
-        //char * codec_fourcc = av_fourcc2str(audiostream->codec->codec_tag);
-        //printf("\t编码格式 %s (%s,%s)\n",avcodocname,profilestring,codec_fourcc);
-        printf("\t音频采样率 : %d Hz\n",audiostream->codec->sample_rate);
-        printf("\t音频声道数 : %d \n",audiostream->codec->channels);
-        printf("\t音频流比特率 : %f kbps\n",audiostream->codec->bit_rate / 1000.0);
-        double s = audiostream->duration * av_q2d(audiostream->time_base);
-        int64_t tbits = audiostream->codec->bit_rate * s;
-        double stsize = tbits / 8;
-        printf("\t音频流大小(Bytes) : %s\n",BytesToSize(stsize));
-    }
+	cleanup:
+	    if (fifo)
+	        av_audio_fifo_free(fifo);
+	    swr_free(&resample_context);
+	    if (output_codec_context)
+	        avcodec_free_context(&output_codec_context);
+	    if (output_format_context) {
+	        avio_closep(&output_format_context->pb);
+	        avformat_free_context(output_format_context);
+	    }
+	    if (input_codec_context)
+	        avcodec_free_context(&input_codec_context);
+	    if (input_format_context)
+	        avformat_close_input(&input_format_context);
 }
 
 int main(){
 	//av_register_all();
-	cout<<"audio info:"<<endl;
 	char *path = "/home/jx/work/ide/eclipse-cpp-oxygen-1a-linux-gtk-x86_64/project/ffmpegtest1/1.mp3";
-	read_av_info(path);
+	char *outpath = "/home/jx/work/ide/eclipse-cpp-oxygen-1a-linux-gtk-x86_64/project/ffmpegtest1/1_.mp4";
+	//read_av_info(path);
+	transcodecAudio(path, outpath);
 	return 0;
 }
